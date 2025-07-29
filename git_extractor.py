@@ -2,16 +2,18 @@
 """
 Git Commit Extractor
 
-Extracts commit information and diffs for a specific author from multiple local git repositories.
-Usage: python git_extractor.py [repo_path] (if repo_path provided, ignores config repositories)
+Automatically discovers and extracts commit information from all git repositories
+under a base directory for a specific author.
+Usage: python git_extractor.py [repo_path] (if repo_path provided, processes single repo)
 """
 
 import sys
 import json
 import yaml
+import fnmatch
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from dataclasses import dataclass, asdict
 from git import Repo, Commit
 from git.exc import GitCommandError, InvalidGitRepositoryError
@@ -33,10 +35,120 @@ class CommitInfo:
 
 
 @dataclass
-class RepositoryConfig:
-    """Data class for repository configuration"""
-    path: str
-    name: Optional[str] = None
+class RepositoryInfo:
+    """Data class for repository information"""
+    path: Path
+    name: str
+    relative_path: str
+
+
+class GitRepositoryScanner:
+    """Class for scanning and discovering git repositories"""
+
+    def __init__(self, base_path: str, config: Dict[str, Any]):
+        self.base_path = Path(base_path).resolve()
+        self.config = config
+        self.scanning_config = config.get('scanning', {})
+
+    def _is_excluded(self, path: Path) -> bool:
+        """Check if path matches any exclusion patterns"""
+        exclude_patterns = self.scanning_config.get('exclude_patterns', [])
+
+        for pattern in exclude_patterns:
+            # Check if any part of the path matches the pattern
+            for part in path.parts:
+                if fnmatch.fnmatch(part, pattern):
+                    return True
+
+            # Also check the full relative path
+            try:
+                relative_path = path.relative_to(self.base_path)
+                if fnmatch.fnmatch(str(relative_path), pattern):
+                    return True
+            except ValueError:
+                pass
+
+        return False
+
+    def _is_git_repository(self, path: Path) -> bool:
+        """Check if a directory is a git repository"""
+        try:
+            repo = Repo(str(path))
+
+            # Check if we should include bare repositories
+            if repo.bare and not self.scanning_config.get('include_bare', False):
+                return False
+
+            return True
+        except (InvalidGitRepositoryError, Exception):
+            return False
+
+    def _scan_directory(self, current_path: Path, current_depth: int, max_depth: int) -> List[RepositoryInfo]:
+        """Recursively scan directory for git repositories"""
+        repositories = []
+
+        # Check depth limit
+        if 0 < max_depth < current_depth:
+            return repositories
+
+        try:
+            # Check if current directory is excluded
+            if self._is_excluded(current_path):
+                return repositories
+
+            # Check if current directory is a git repository
+            if self._is_git_repository(current_path):
+                relative_path = current_path.relative_to(self.base_path)
+                repo_name = current_path.name
+
+                repositories.append(RepositoryInfo(
+                    path=current_path,
+                    name=repo_name,
+                    relative_path=str(relative_path)
+                ))
+
+                # If it's a git repo, don't scan its subdirectories
+                # (avoid scanning .git subdirectories and nested repos)
+                return repositories
+
+            # Scan subdirectories
+            if current_path.is_dir():
+                try:
+                    for item in current_path.iterdir():
+                        if item.is_dir() and not item.name.startswith('.'):
+                            sub_repos = self._scan_directory(item, current_depth + 1, max_depth)
+                            repositories.extend(sub_repos)
+                except PermissionError:
+                    print(f"Permission denied accessing: {current_path}")
+                except Exception as e:
+                    print(f"Error scanning directory {current_path}: {e}")
+
+        except Exception as e:
+            print(f"Error processing {current_path}: {e}")
+
+        return repositories
+
+    def discover_repositories(self) -> List[RepositoryInfo]:
+        """Discover all git repositories under the base path"""
+        if not self.base_path.exists():
+            print(f"Base path does not exist: {self.base_path}")
+            return []
+
+        if not self.base_path.is_dir():
+            print(f"Base path is not a directory: {self.base_path}")
+            return []
+
+        print(f"Scanning for git repositories under: {self.base_path}")
+        max_depth = self.scanning_config.get('max_depth', 2)
+        print(f"Maximum scan depth: {max_depth if max_depth > 0 else 'unlimited'}")
+
+        if self.scanning_config.get('exclude_patterns'):
+            print(f"Excluding patterns: {', '.join(self.scanning_config['exclude_patterns'])}")
+
+        repositories = self._scan_directory(self.base_path, 1, max_depth)
+
+        print(f"Found {len(repositories)} git repositories")
+        return sorted(repositories, key=lambda r: r.relative_path)
 
 
 class GitCommitExtractor:
@@ -44,7 +156,7 @@ class GitCommitExtractor:
 
     def __init__(self, config_path: str = "config.yaml", single_repo: Optional[str] = None):
         self.config = self._load_config(config_path)
-        self.repositories = self._parse_repositories(single_repo)
+        self.repositories = self._discover_repositories(single_repo)
         self._ensure_output_directory()
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
@@ -62,7 +174,12 @@ class GitCommitExtractor:
     def _get_default_config(self) -> Dict[str, Any]:
         """Return default configuration"""
         return {
-            'repositories': [],
+            'scanning': {
+                'base_path': '.',
+                'max_depth': 2,
+                'exclude_patterns': ['node_modules', '.venv', 'venv', '__pycache__'],
+                'include_bare': False
+            },
             'author': {'name': '', 'email': ''},
             'output': {
                 'format': 'json',
@@ -73,72 +190,42 @@ class GitCommitExtractor:
             'filters': {'max_commits': 100, 'date_from': None, 'date_to': None}
         }
 
-    def _parse_repositories(self, single_repo: Optional[str]) -> List[RepositoryConfig]:
-        """Parse repository configurations from config or single repo argument"""
-        repositories = []
-
-        # If single repo provided via argument, use that instead of config
+    def _discover_repositories(self, single_repo: Optional[str]) -> List[RepositoryInfo]:
+        """Discover repositories either from single path or by scanning base path"""
         if single_repo:
-            repo_path = Path(single_repo)
-            repo_name = repo_path.name
-            return [RepositoryConfig(path=single_repo, name=repo_name)]
+            # Process single repository provided via argument
+            repo_path = Path(single_repo).resolve()
+            return [RepositoryInfo(
+                path=repo_path,
+                name=repo_path.name,
+                relative_path=repo_path.name
+            )]
 
-        # Parse repositories from config
-        repo_configs = self.config.get('repositories', [])
-        if not repo_configs:
-            print("No repositories specified in config file")
+        # Discover repositories by scanning base path
+        base_path = self.config['scanning'].get('base_path', '.')
+        if not base_path:
+            print("No base_path specified in scanning configuration")
             return []
 
-        for repo_config in repo_configs:
-            if isinstance(repo_config, str):
-                # Simple string path
-                repo_path = Path(repo_config)
-                repositories.append(RepositoryConfig(
-                    path=repo_config,
-                    name=repo_path.name
-                ))
-            elif isinstance(repo_config, dict):
-                # Dictionary with path and optional name
-                path = repo_config.get('path')
-                if not path:
-                    print(f"Warning: Repository config missing 'path': {repo_config}")
-                    continue
-
-                name = repo_config.get('name')
-                if not name:
-                    name = Path(path).name
-
-                repositories.append(RepositoryConfig(path=path, name=name))
-            else:
-                print(f"Warning: Invalid repository config: {repo_config}")
-
-        return repositories
+        scanner = GitRepositoryScanner(base_path, self.config)
+        return scanner.discover_repositories()
 
     def _ensure_output_directory(self):
         """Create output directory if it doesn't exist"""
         output_dir = Path(self.config['output'].get('directory', 'output'))
         output_dir.mkdir(exist_ok=True)
 
-    def _initialize_repo(self, repo_path: str) -> Optional[Repo]:
+    def _initialize_repo(self, repo_info: RepositoryInfo) -> Optional[Repo]:
         """Initialize git repository"""
         try:
-            path = Path(repo_path)
-            if not path.exists():
-                print(f"Warning: Repository path does not exist: {repo_path}")
-                return None
-
-            repo = Repo(repo_path)
-            if repo.bare:
-                print(f"Warning: Repository is bare: {repo_path}")
-                return None
-
+            repo = Repo(str(repo_info.path))
             return repo
 
         except InvalidGitRepositoryError as e:
-            print(f"Warning: Invalid git repository at {repo_path}: {e}")
+            print(f"Warning: Invalid git repository at {repo_info.path}: {e}")
             return None
         except Exception as e:
-            print(f"Warning: Error initializing repository {repo_path}: {e}")
+            print(f"Warning: Error initializing repository {repo_info.path}: {e}")
             return None
 
     def _matches_author(self, commit: Commit) -> bool:
@@ -232,16 +319,17 @@ class GitCommitExtractor:
             diff=diff
         )
 
-    def extract_commits_from_repo(self, repo_config: RepositoryConfig) -> List[CommitInfo]:
+    def extract_commits_from_repo(self, repo_info: RepositoryInfo) -> List[CommitInfo]:
         """Extract commits from a single repository"""
-        print(f"\n{'='*60}")
-        print(f"Processing repository: {repo_config.name}")
-        print(f"Path: {repo_config.path}")
-        print(f"{'='*60}")
+        print(f"\n{'='*80}")
+        print(f"Processing repository: {repo_info.name}")
+        print(f"Path: {repo_info.path}")
+        print(f"Relative path: {repo_info.relative_path}")
+        print(f"{'='*80}")
 
-        repo = self._initialize_repo(repo_config.path)
+        repo = self._initialize_repo(repo_info)
         if not repo:
-            print(f"Skipping repository: {repo_config.name}")
+            print(f"Skipping repository: {repo_info.name}")
             return []
 
         commits_info = []
@@ -259,7 +347,7 @@ class GitCommitExtractor:
 
                 processed_count += 1
                 if processed_count % 100 == 0:
-                    print(f"Processed {processed_count} commits, found {len(commits_info)} matches...")
+                    print(f"  Processed {processed_count} commits, found {len(commits_info)} matches...")
 
                 # Filter by author
                 if not self._matches_author(commit):
@@ -274,19 +362,25 @@ class GitCommitExtractor:
                 commits_info.append(commit_info)
 
         except Exception as e:
-            print(f"Error while processing commits in {repo_config.name}: {e}")
+            print(f"Error while processing commits in {repo_info.name}: {e}")
 
-        print(f"Found {len(commits_info)} matching commits out of {processed_count} total commits")
+        print(f"✓ Found {len(commits_info)} matching commits out of {processed_count} total commits")
         return commits_info
 
-    def _generate_filename(self, repo_name: str) -> str:
+    def _generate_filename(self, repo_info: RepositoryInfo) -> str:
         """Generate output filename based on template"""
         output_config = self.config['output']
         template = output_config.get('filename_template', '{name}_commits.{ext}')
         ext = 'json' if output_config.get('format', 'json').lower() == 'json' else 'txt'
 
+        # Use relative path as name if it provides more context
+        name = repo_info.name
+        if len(repo_info.relative_path.split('/')) > 1:
+            # Replace path separators with underscores for filename
+            name = repo_info.relative_path.replace('/', '_').replace('\\', '_')
+
         filename = template.format(
-            name=repo_name,
+            name=name,
             date=datetime.now().strftime('%Y%m%d'),
             ext=ext
         )
@@ -294,25 +388,27 @@ class GitCommitExtractor:
         output_dir = Path(output_config.get('directory', 'output'))
         return str(output_dir / filename)
 
-    def save_output(self, commits: List[CommitInfo], repo_config: RepositoryConfig):
+    def save_output(self, commits: List[CommitInfo], repo_info: RepositoryInfo):
         """Save the extracted commits to file"""
         if not commits:
-            print(f"No commits to save for {repo_config.name}")
+            print(f"  No commits to save for {repo_info.name}")
             return
 
         output_format = self.config['output'].get('format', 'json')
-        filename = self._generate_filename(repo_config.name)
+        filename = self._generate_filename(repo_info)
 
         if output_format.lower() == 'json':
-            self._save_as_json(commits, filename, repo_config)
+            self._save_as_json(commits, filename, repo_info)
         else:
-            print(f"Can not save unknown export format {output_format.lower}")
-    def _save_as_json(self, commits: List[CommitInfo], filename: str, repo_config: RepositoryConfig):
+            self._save_as_text(commits, filename, repo_info)
+
+    def _save_as_json(self, commits: List[CommitInfo], filename: str, repo_info: RepositoryInfo):
         """Save commits as JSON file"""
         data = {
             'meta': {
-                'repository_name': repo_config.name,
-                'repository_path': repo_config.path,
+                'repository_name': repo_info.name,
+                'repository_path': str(repo_info.path),
+                'relative_path': repo_info.relative_path,
                 'total_commits': len(commits),
                 'extracted_at': datetime.now().isoformat(),
                 'author_filter': self.config['author']
@@ -323,45 +419,89 @@ class GitCommitExtractor:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-        print(f"✓ Saved {len(commits)} commits to {filename}")
+        print(f"  ✓ Saved {len(commits)} commits to {filename}")
 
+    def _save_as_text(self, commits: List[CommitInfo], filename: str, repo_info: RepositoryInfo):
+        """Save commits as text file"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"Git Commit Extract Report\n")
+            f.write(f"========================\n")
+            f.write(f"Repository Name: {repo_info.name}\n")
+            f.write(f"Repository Path: {repo_info.path}\n")
+            f.write(f"Relative Path: {repo_info.relative_path}\n")
+            f.write(f"Author Filter: {self.config['author']}\n")
+            f.write(f"Total Commits: {len(commits)}\n")
+            f.write(f"Generated: {datetime.now().isoformat()}\n\n")
+
+            for i, commit in enumerate(commits, 1):
+                f.write(f"Commit #{i}\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"Hash: {commit.hash}\n")
+                f.write(f"Author: {commit.author_name} <{commit.author_email}>\n")
+                f.write(f"Date: {commit.date}\n")
+                f.write(f"Files Changed: {len(commit.files_changed)}\n")
+                f.write(f"Insertions: +{commit.insertions}, Deletions: -{commit.deletions}\n")
+                f.write(f"Message:\n{commit.message}\n")
+
+                if commit.files_changed:
+                    f.write(f"Changed Files:\n")
+                    for file_path in commit.files_changed:
+                        f.write(f"  - {file_path}\n")
+
+                if commit.diff:
+                    f.write(f"\nDiff:\n")
+                    f.write(commit.diff)
+
+                f.write(f"\n{'-' * 80}\n\n")
+
+        print(f"  ✓ Saved {len(commits)} commits to {filename}")
 
     def process_all_repositories(self):
-        """Process all configured repositories"""
+        """Process all discovered repositories"""
         if not self.repositories:
             print("No repositories to process")
             return
 
-        print(f"Starting extraction from {len(self.repositories)} repositories...")
+        print(f"\n{'='*80}")
+        print(f"STARTING EXTRACTION")
+        print(f"{'='*80}")
+        print(f"Repositories found: {len(self.repositories)}")
         print(f"Author filter: {self.config['author']}")
         print(f"Output directory: {self.config['output'].get('directory', 'output')}")
+
+        # Show discovered repositories
+        print(f"\nDiscovered repositories:")
+        for i, repo in enumerate(self.repositories, 1):
+            print(f"  {i:2d}. {repo.relative_path} ({repo.name})")
 
         total_commits = 0
         successful_repos = 0
 
-        for repo_config in self.repositories:
+        for repo_info in self.repositories:
             try:
-                commits = self.extract_commits_from_repo(repo_config)
+                commits = self.extract_commits_from_repo(repo_info)
                 if commits:
-                    self.save_output(commits, repo_config)
+                    self.save_output(commits, repo_info)
                     total_commits += len(commits)
                     successful_repos += 1
                 else:
-                    print(f"No commits found for {repo_config.name}")
+                    print(f"  No matching commits found for {repo_info.name}")
 
             except KeyboardInterrupt:
                 print(f"\nOperation cancelled by user")
                 break
             except Exception as e:
-                print(f"Error processing repository {repo_config.name}: {e}")
+                print(f"  Error processing repository {repo_info.name}: {e}")
                 continue
 
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print(f"EXTRACTION SUMMARY")
-        print(f"{'='*60}")
+        print(f"{'='*80}")
         print(f"Repositories processed: {successful_repos}/{len(self.repositories)}")
         print(f"Total commits extracted: {total_commits}")
         print(f"Output directory: {self.config['output'].get('directory', 'output')}")
+        if total_commits > 0:
+            print(f"Average commits per repo: {total_commits/successful_repos:.1f}")
 
 
 def main():
@@ -374,7 +514,7 @@ def main():
     elif len(sys.argv) > 2:
         print("Usage: python git_extractor.py [repo_path]")
         print("If repo_path is provided, it will process only that repository.")
-        print("Otherwise, it will process all repositories listed in config.yaml")
+        print("Otherwise, it will scan base_path from config.yaml for git repositories.")
         sys.exit(1)
 
     try:

@@ -2,8 +2,8 @@
 """
 Git Commit Extractor
 
-Extracts commit information and diffs for a specific author from a local git repository.
-Usage: python git_extractor.py <repo_path>
+Extracts commit information and diffs for a specific author from multiple local git repositories.
+Usage: python git_extractor.py [repo_path] (if repo_path provided, ignores config repositories)
 """
 
 import sys
@@ -32,13 +32,20 @@ class CommitInfo:
     diff: Optional[str] = None
 
 
+@dataclass
+class RepositoryConfig:
+    """Data class for repository configuration"""
+    path: str
+    name: Optional[str] = None
+
+
 class GitCommitExtractor:
     """Main class for extracting git commit information"""
 
-    def __init__(self, repo_path: str, config_path: str = "config.yaml"):
-        self.repo_path = Path(repo_path)
+    def __init__(self, config_path: str = "config.yaml", single_repo: Optional[str] = None):
         self.config = self._load_config(config_path)
-        self.repo = None
+        self.repositories = self._parse_repositories(single_repo)
+        self._ensure_output_directory()
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load configuration from YAML file"""
@@ -55,28 +62,84 @@ class GitCommitExtractor:
     def _get_default_config(self) -> Dict[str, Any]:
         """Return default configuration"""
         return {
+            'repositories': [],
             'author': {'name': '', 'email': ''},
-            'output': {'format': 'json', 'file': 'commits_output.json', 'include_diff': True},
+            'output': {
+                'format': 'json',
+                'directory': 'output',
+                'filename_template': '{name}_commits.{ext}',
+                'include_diff': True
+            },
             'filters': {'max_commits': 100, 'date_from': None, 'date_to': None}
         }
 
-    def _initialize_repo(self):
+    def _parse_repositories(self, single_repo: Optional[str]) -> List[RepositoryConfig]:
+        """Parse repository configurations from config or single repo argument"""
+        repositories = []
+
+        # If single repo provided via argument, use that instead of config
+        if single_repo:
+            repo_path = Path(single_repo)
+            repo_name = repo_path.name
+            return [RepositoryConfig(path=single_repo, name=repo_name)]
+
+        # Parse repositories from config
+        repo_configs = self.config.get('repositories', [])
+        if not repo_configs:
+            print("No repositories specified in config file")
+            return []
+
+        for repo_config in repo_configs:
+            if isinstance(repo_config, str):
+                # Simple string path
+                repo_path = Path(repo_config)
+                repositories.append(RepositoryConfig(
+                    path=repo_config,
+                    name=repo_path.name
+                ))
+            elif isinstance(repo_config, dict):
+                # Dictionary with path and optional name
+                path = repo_config.get('path')
+                if not path:
+                    print(f"Warning: Repository config missing 'path': {repo_config}")
+                    continue
+
+                name = repo_config.get('name')
+                if not name:
+                    name = Path(path).name
+
+                repositories.append(RepositoryConfig(path=path, name=name))
+            else:
+                print(f"Warning: Invalid repository config: {repo_config}")
+
+        return repositories
+
+    def _ensure_output_directory(self):
+        """Create output directory if it doesn't exist"""
+        output_dir = Path(self.config['output'].get('directory', 'output'))
+        output_dir.mkdir(exist_ok=True)
+
+    def _initialize_repo(self, repo_path: str) -> Optional[Repo]:
         """Initialize git repository"""
         try:
-            if not self.repo_path.exists():
-                raise FileNotFoundError(f"Repository path does not exist: {self.repo_path}")
+            path = Path(repo_path)
+            if not path.exists():
+                print(f"Warning: Repository path does not exist: {repo_path}")
+                return None
 
-            self.repo = Repo(self.repo_path)
-            if self.repo.bare:
-                raise InvalidGitRepositoryError("Repository is bare")
+            repo = Repo(repo_path)
+            if repo.bare:
+                print(f"Warning: Repository is bare: {repo_path}")
+                return None
+
+            return repo
 
         except InvalidGitRepositoryError as e:
-            print(f"Error: Invalid git repository at {self.repo_path}")
-            print(f"Details: {e}")
-            sys.exit(1)
+            print(f"Warning: Invalid git repository at {repo_path}: {e}")
+            return None
         except Exception as e:
-            print(f"Error initializing repository: {e}")
-            sys.exit(1)
+            print(f"Warning: Error initializing repository {repo_path}: {e}")
+            return None
 
     def _matches_author(self, commit: Commit) -> bool:
         """Check if commit author matches the configured author"""
@@ -85,7 +148,6 @@ class GitCommitExtractor:
         author_email = config_author.get('email', '').strip()
 
         if not author_name and not author_email:
-            print("Warning: No author name or email specified in config")
             return False
 
         # Check name match
@@ -128,7 +190,7 @@ class GitCommitExtractor:
         except:
             return 0, 0
 
-    def _get_commit_diff(self, commit: Commit) -> Optional[str]:
+    def _get_commit_diff(self, commit: Commit, repo: Repo) -> Optional[str]:
         """Get the diff for a commit"""
         if not self.config['output'].get('include_diff', True):
             return None
@@ -136,19 +198,19 @@ class GitCommitExtractor:
         try:
             # Get diff against parent commit
             if commit.parents:
-                diff = self.repo.git.diff(commit.parents[0], commit, unified=3)
+                diff = repo.git.diff(commit.parents[0], commit, unified=3)
             else:
                 # For initial commit, show diff against empty tree
-                diff = self.repo.git.show(commit.hexsha, format='', unified=3)
+                diff = repo.git.show(commit.hexsha, format='', unified=3)
             return diff
         except GitCommandError as e:
             print(f"Warning: Could not get diff for commit {commit.hexsha[:8]}: {e}")
             return None
 
-    def _create_commit_info(self, commit: Commit) -> CommitInfo:
+    def _create_commit_info(self, commit: Commit, repo: Repo) -> CommitInfo:
         """Create CommitInfo object from git commit"""
         insertions, deletions = self._get_commit_stats(commit)
-        diff = self._get_commit_diff(commit)
+        diff = self._get_commit_diff(commit, repo)
 
         # Get list of changed files
         files_changed = []
@@ -170,20 +232,27 @@ class GitCommitExtractor:
             diff=diff
         )
 
-    def extract_commits(self) -> List[CommitInfo]:
-        """Extract commits matching the criteria"""
-        self._initialize_repo()
+    def extract_commits_from_repo(self, repo_config: RepositoryConfig) -> List[CommitInfo]:
+        """Extract commits from a single repository"""
+        print(f"\n{'='*60}")
+        print(f"Processing repository: {repo_config.name}")
+        print(f"Path: {repo_config.path}")
+        print(f"{'='*60}")
+
+        repo = self._initialize_repo(repo_config.path)
+        if not repo:
+            print(f"Skipping repository: {repo_config.name}")
+            return []
 
         commits_info = []
         max_commits = self.config['filters'].get('max_commits', 0)
         processed_count = 0
 
-        print(f"Scanning repository: {self.repo_path}")
         print(f"Looking for commits by: {self.config['author']}")
 
         try:
             # Iterate through all commits
-            for commit in self.repo.iter_commits():
+            for commit in repo.iter_commits():
                 # Check if we've reached the max limit
                 if max_commits > 0 and len(commits_info) >= max_commits:
                     break
@@ -201,34 +270,51 @@ class GitCommitExtractor:
                     continue
 
                 # Create commit info and add to list
-                commit_info = self._create_commit_info(commit)
+                commit_info = self._create_commit_info(commit, repo)
                 commits_info.append(commit_info)
 
         except Exception as e:
-            print(f"Error while processing commits: {e}")
-            return commits_info
+            print(f"Error while processing commits in {repo_config.name}: {e}")
 
         print(f"Found {len(commits_info)} matching commits out of {processed_count} total commits")
         return commits_info
 
-    def save_output(self, commits: List[CommitInfo]):
-        """Save the extracted commits to file"""
+    def _generate_filename(self, repo_name: str) -> str:
+        """Generate output filename based on template"""
         output_config = self.config['output']
-        output_file = output_config.get('file', 'commits_output.json')
-        output_format = output_config.get('format', 'json')
+        template = output_config.get('filename_template', '{name}_commits.{ext}')
+        ext = 'json' if output_config.get('format', 'json').lower() == 'json' else 'txt'
+
+        filename = template.format(
+            name=repo_name,
+            date=datetime.now().strftime('%Y%m%d'),
+            ext=ext
+        )
+
+        output_dir = Path(output_config.get('directory', 'output'))
+        return str(output_dir / filename)
+
+    def save_output(self, commits: List[CommitInfo], repo_config: RepositoryConfig):
+        """Save the extracted commits to file"""
+        if not commits:
+            print(f"No commits to save for {repo_config.name}")
+            return
+
+        output_format = self.config['output'].get('format', 'json')
+        filename = self._generate_filename(repo_config.name)
 
         if output_format.lower() == 'json':
-            self._save_as_json(commits, output_file)
+            self._save_as_json(commits, filename, repo_config)
         else:
-            self._save_as_text(commits, output_file)
-
-    def _save_as_json(self, commits: List[CommitInfo], filename: str):
+            print(f"Can not save unknown export format {output_format.lower}")
+    def _save_as_json(self, commits: List[CommitInfo], filename: str, repo_config: RepositoryConfig):
         """Save commits as JSON file"""
         data = {
             'meta': {
+                'repository_name': repo_config.name,
+                'repository_path': repo_config.path,
                 'total_commits': len(commits),
                 'extracted_at': datetime.now().isoformat(),
-                'repository': str(self.repo_path),
                 'author_filter': self.config['author']
             },
             'commits': [asdict(commit) for commit in commits]
@@ -237,58 +323,63 @@ class GitCommitExtractor:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-        print(f"Saved {len(commits)} commits to {filename}")
+        print(f"✓ Saved {len(commits)} commits to {filename}")
 
-    def _save_as_text(self, commits: List[CommitInfo], filename: str):
-        """Save commits as text file"""
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(f"Git Commit Extract Report\n")
-            f.write(f"========================\n")
-            f.write(f"Repository: {self.repo_path}\n")
-            f.write(f"Author Filter: {self.config['author']}\n")
-            f.write(f"Total Commits: {len(commits)}\n")
-            f.write(f"Generated: {datetime.now().isoformat()}\n\n")
 
-            for i, commit in enumerate(commits, 1):
-                f.write(f"Commit #{i}\n")
-                f.write(f"Hash: {commit.hash}\n")
-                f.write(f"Author: {commit.author_name} <{commit.author_email}>\n")
-                f.write(f"Date: {commit.date}\n")
-                f.write(f"Files Changed: {len(commit.files_changed)}\n")
-                f.write(f"Insertions: +{commit.insertions}, Deletions: -{commit.deletions}\n")
-                f.write(f"Message:\n{commit.message}\n")
+    def process_all_repositories(self):
+        """Process all configured repositories"""
+        if not self.repositories:
+            print("No repositories to process")
+            return
 
-                if commit.files_changed:
-                    f.write(f"Changed Files:\n")
-                    for file_path in commit.files_changed:
-                        f.write(f"  - {file_path}\n")
+        print(f"Starting extraction from {len(self.repositories)} repositories...")
+        print(f"Author filter: {self.config['author']}")
+        print(f"Output directory: {self.config['output'].get('directory', 'output')}")
 
-                if commit.diff:
-                    f.write(f"\nDiff:\n")
-                    f.write(commit.diff)
+        total_commits = 0
+        successful_repos = 0
 
-                f.write(f"\n{'-' * 80}\n\n")
+        for repo_config in self.repositories:
+            try:
+                commits = self.extract_commits_from_repo(repo_config)
+                if commits:
+                    self.save_output(commits, repo_config)
+                    total_commits += len(commits)
+                    successful_repos += 1
+                else:
+                    print(f"No commits found for {repo_config.name}")
 
-        print(f"Saved {len(commits)} commits to {filename}")
+            except KeyboardInterrupt:
+                print(f"\nOperation cancelled by user")
+                break
+            except Exception as e:
+                print(f"Error processing repository {repo_config.name}: {e}")
+                continue
+
+        print(f"\n{'='*60}")
+        print(f"EXTRACTION SUMMARY")
+        print(f"{'='*60}")
+        print(f"Repositories processed: {successful_repos}/{len(self.repositories)}")
+        print(f"Total commits extracted: {total_commits}")
+        print(f"Output directory: {self.config['output'].get('directory', 'output')}")
 
 
 def main():
     """Main function"""
-    if len(sys.argv) != 2:
-        print("Usage: python git_extractor.py <repo_path>")
-        print("Make sure config.yaml exists in the same directory")
+    single_repo = None
+
+    # Check if a single repository path was provided as argument
+    if len(sys.argv) == 2:
+        single_repo = sys.argv[1]
+    elif len(sys.argv) > 2:
+        print("Usage: python git_extractor.py [repo_path]")
+        print("If repo_path is provided, it will process only that repository.")
+        print("Otherwise, it will process all repositories listed in config.yaml")
         sys.exit(1)
 
-    repo_path = sys.argv[1]
-
     try:
-        extractor = GitCommitExtractor(repo_path)
-        commits = extractor.extract_commits()
-
-        if commits:
-            extractor.save_output(commits)
-        else:
-            print("No commits found matching the criteria")
+        extractor = GitCommitExtractor(single_repo=single_repo)
+        extractor.process_all_repositories()
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")

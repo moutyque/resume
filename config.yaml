@@ -1,0 +1,26 @@
+# Configuration for git commit extractor
+scanning:
+  base_path: "/path/to/projects"  # Base directory to scan for git repositories
+  max_depth: 2  # Maximum depth to scan (1 = direct children only, 0 = unlimited)
+  exclude_patterns:  # Optional: patterns to exclude from scanning
+    - "node_modules"
+    - ".venv"
+    - "venv"
+    - "__pycache__"
+    - "*.tmp"
+  include_bare: false  # Whether to include bare repositories
+
+author:
+  name: "John Doe"  # Author name to filter commits
+  email: "john.doe@example.com"  # Optional: author email to filter commits
+
+output:
+  format: "json"  # Options: json, text
+  directory: "output"  # Directory to store output files
+  filename_template: "{name}_commits.{ext}"  # Template: {name}, {date}, {ext}
+  include_diff: true  # Whether to include commit diffs
+
+filters:
+  max_commits: 100  # Maximum number of commits to process (0 for all)
+  date_from: null  # ISO format: "2023-01-01" or null for no limit
+  date_to: null    # ISO format: "2023-12-31" or null for no limit

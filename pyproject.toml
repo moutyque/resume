@@ -2,12 +2,15 @@
 name = "git-commit-extractor"
 version = "0.1.0"
 description = "Extract commit info and diffs for a specific author"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Quentin MOUTY <azfboom@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = "^3.12"
 gitpython = "^3.1.40"
 pyyaml = "^6.0.1"
+openai = "^1.97.1"
+anthropic = "^0.60.0"
+requests = "^2.32.4"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

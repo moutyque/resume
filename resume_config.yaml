@@ -1,0 +1,33 @@
+# Resume Builder Configuration
+
+input:
+  data_directory: "output"  # Directory containing commit JSON files
+  file_pattern: "*_commits.json"  # Pattern to match commit files
+
+output:
+  filename: "generated_resume.json"  # Output filename
+  include_analysis: true  # Include detailed analysis in output
+  format: "json"  # Output format (json, markdown planned)
+
+llm:
+  provider: "private"  # Options: openai, anthropic, private
+  endpoint: "http://localhost:8000/v1/chat/completions"  # Your private endpoint URL
+  api_key: "your-optional-api-key"  # API key if required by your endpoint
+  model: "your-model-name"  # Model identifier for your endpoint
+  headers:  # Additional headers if needed
+    Content-Type: "application/json"
+    # Authorization: "Bearer your-token"  # If different from api_key
+  timeout: 60  # Request timeout in seconds
+  max_tokens: 2000
+  temperature: 0.7
+
+analysis:
+  min_commits_per_project: 5  # Minimum commits to include a project
+  exclude_projects: []  # Project names to exclude from analysis
+  focus_recent_months: 12  # Focus on recent X months (0 = all time)
+
+# Customize the resume generation
+resume_style:
+  tone: "professional"  # professional, technical, creative
+  focus: "full-stack"  # full-stack, frontend, backend, devops, etc.
+  experience_level: "mid-level"  # junior, mid-level, senior, lead

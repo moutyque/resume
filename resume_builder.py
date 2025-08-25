@@ -179,7 +179,7 @@ class LLMResumeGenerator:
                 headers['Authorization'] = f"Bearer {config['api_key']}"
 
         self.session.headers.update(headers)
-        self.timeout = config.get('timeout', 60)
+        self.timeout = config.get('timeout', 600)
 
         if self.provider == 'openai':
             import openai
@@ -214,7 +214,6 @@ class LLMResumeGenerator:
         # Format payload based on common API patterns
         # This supports both OpenAI-compatible and custom formats
         payload = {
-            "model": self.config.get('model', 'default'),
             "messages": [
                 {
                     "role": "system",
@@ -285,7 +284,8 @@ class LLMResumeGenerator:
     def _parse_llm_response(self, content: str) -> Dict[str, Any]:
         """Parse and validate LLM response content"""
         content = content.strip()
-
+        print("Content")
+        print(content)
         # Try to extract JSON from markdown code blocks
         if '```json' in content:
             json_start = content.find('```json') + 7

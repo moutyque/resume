@@ -8,9 +8,10 @@ authors = ["Quentin MOUTY <azfboom@gmail.com>"]
 python = "^3.12"
 gitpython = "^3.1.40"
 pyyaml = "^6.0.1"
-openai = "^1.97.1"
-anthropic = "^0.60.0"
+openai = "^1.101.0"
+anthropic = "^0.64.0"
 requests = "^2.32.4"
+poetry-core = "^2.1.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"
